@@ -6262,12 +6262,46 @@ static inline int select_idle_smt(struct task_struct *p, struct sched_domain *sd
 
 #endif /* CONFIG_SCHED_SMT */
 
+#ifdef CONFIG_SCHED_CLUSTER
+/*
+ * Scan the cluster domain for idle CPUs and clear cluster cpumask after scanning
+ */
+static inline int scan_cluster(struct task_struct *p, int prev_cpu, int target)
+{
+	struct cpumask *cpus = this_cpu_cpumask_var_ptr(select_idle_mask);
+	struct sched_domain *sd = rcu_dereference(per_cpu(sd_cluster, target));
+	int cpu, idle_cpu;
+
+	/* TODO: Support SMT case while a machine with both cluster and SMT born */
+	if (!sched_smt_active() && sd) {
+		for_each_cpu_and(cpu, cpus, sched_domain_span(sd)) {
+			idle_cpu = __select_idle_cpu(cpu, p);
+			if ((unsigned int)idle_cpu < nr_cpumask_bits)
+				return idle_cpu;
+		}
+
+		/* Don't ping-pong tasks in and out cluster frequently */
+		if (cpus_share_resources(target, prev_cpu))
+			return target;
+
+		cpumask_andnot(cpus, cpus, sched_domain_span(sd));
+	}
+
+	return -1;
+}
+#else
+static inline int scan_cluster(struct task_struct *p, int prev_cpu, int target)
+{
+	return -1;
+}
+#endif
+
 /*
  * Scan the LLC domain for idle CPUs; this is dynamically regulated by
  * comparing the average scan cost (tracked in sd->avg_scan_cost) against the
  * average idle time for this rq (as found in rq->avg_idle).
  */
-static int select_idle_cpu(struct task_struct *p, struct sched_domain *sd, bool has_idle_core, int target)
+static int select_idle_cpu(struct task_struct *p, struct sched_domain *sd, bool has_idle_core, int prev_cpu, int target)
 {
 	struct cpumask *cpus = this_cpu_cpumask_var_ptr(select_idle_mask);
 	int i, cpu, idle_cpu = -1, nr = INT_MAX;
@@ -6281,6 +6315,10 @@ static int select_idle_cpu(struct task_struct *p, struct sched_domain *sd, bool 
 		return -1;
 
 	cpumask_and(cpus, sched_domain_span(sd), p->cpus_ptr);
+
+	idle_cpu = scan_cluster(p, prev_cpu, target);
+	if ((unsigned int)idle_cpu < nr_cpumask_bits)
+		return idle_cpu;
 
 	if (sched_feat(SIS_PROP) && !has_idle_core) {
 		u64 avg_cost, avg_idle, span_avg;
@@ -6416,7 +6454,7 @@ static int select_idle_sibling(struct task_struct *p, int prev, int target)
 	/*
 	 * If the previous CPU is cache affine and idle, don't be stupid:
 	 */
-	if (prev != target && cpus_share_cache(prev, target) &&
+	if (prev != target && cpus_share_resources(prev, target) &&
 	    (available_idle_cpu(prev) || sched_idle_cpu(prev)) &&
 	    asym_fits_capacity(task_util, prev))
 		return prev;
@@ -6442,7 +6480,7 @@ static int select_idle_sibling(struct task_struct *p, int prev, int target)
 	p->recent_used_cpu = prev;
 	if (recent_used_cpu != prev &&
 	    recent_used_cpu != target &&
-	    cpus_share_cache(recent_used_cpu, target) &&
+	    cpus_share_resources(recent_used_cpu, target) &&
 	    (available_idle_cpu(recent_used_cpu) || sched_idle_cpu(recent_used_cpu)) &&
 	    cpumask_test_cpu(p->recent_used_cpu, p->cpus_ptr) &&
 	    asym_fits_capacity(task_util, recent_used_cpu)) {
@@ -6483,7 +6521,7 @@ static int select_idle_sibling(struct task_struct *p, int prev, int target)
 		}
 	}
 
-	i = select_idle_cpu(p, sd, has_idle_core, target);
+	i = select_idle_cpu(p, sd, has_idle_core, prev, target);
 	if ((unsigned)i < nr_cpumask_bits)
 		return i;
 
