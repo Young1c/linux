@@ -4,6 +4,7 @@
  * Author: Mathieu Poirier <mathieu.poirier@linaro.org>
  */
 
+#include <dirent.h>
 #include <stdbool.h>
 #include <linux/coresight-pmu.h>
 #include <linux/zalloc.h>
@@ -14,6 +15,7 @@
 #include "../../../util/pmu.h"
 #include "cs-etm.h"
 #include "arm-spe.h"
+#include "hisi_ptt.h"
 
 static struct perf_pmu **find_all_arm_spe_pmus(int *nr_spes, int *err)
 {
@@ -50,6 +52,56 @@ static struct perf_pmu **find_all_arm_spe_pmus(int *nr_spes, int *err)
 	return arm_spe_pmus;
 }
 
+#define for_each_ptt_event(dir, dent)						\
+	while ((dent = readdir(dir)))							\
+		if (strstr(dent->d_name, HISI_PTT_PMU_NAME))		\
+
+static struct perf_pmu **find_all_hisi_ptt_pmus(int *nr_ptts, int *err)
+{
+	struct perf_pmu **hisi_ptt_pmus = NULL;
+	struct dirent *dent;
+	DIR *dir = NULL;
+	int idx = 0;
+
+	dir = opendir(EVENT_SOURCE_DEVICE_PATH);
+	if (!dir) {
+		pr_err("can't read directory '%s'\n", EVENT_SOURCE_DEVICE_PATH);
+		*err = -EINVAL;
+		goto out;
+	}
+
+	for_each_ptt_event(dir, dent)
+		(*nr_ptts)++;
+
+	if (!(*nr_ptts))
+		goto out;
+
+	hisi_ptt_pmus = zalloc(sizeof(struct perf_pmu *) * (*nr_ptts));
+	if (!hisi_ptt_pmus) {
+		pr_err("hisi_ptt alloc failed\n");
+		*err = -ENOMEM;
+		goto out;
+	}
+
+	rewinddir(dir);
+	for_each_ptt_event(dir, dent) {
+		if (idx < (*nr_ptts)) {
+			hisi_ptt_pmus[idx] = perf_pmu__find(dent->d_name);
+			if (hisi_ptt_pmus[idx]) {
+				pr_debug2("%s %d: hisi_ptt_pmu %d type %d name %s\n",
+					  __func__, __LINE__, idx,
+					  hisi_ptt_pmus[idx]->type,
+					  hisi_ptt_pmus[idx]->name);
+				idx++;
+			}
+		}
+	}
+
+out:
+	closedir(dir);
+	return hisi_ptt_pmus;
+}
+
 struct auxtrace_record
 *auxtrace_record__init(struct evlist *evlist, int *err)
 {
@@ -57,8 +109,12 @@ struct auxtrace_record
 	struct evsel *evsel;
 	bool found_etm = false;
 	struct perf_pmu *found_spe = NULL;
+	struct perf_pmu *found_ptt = NULL;
 	struct perf_pmu **arm_spe_pmus = NULL;
+	struct perf_pmu **hisi_ptt_pmus = NULL;
+
 	int nr_spes = 0;
+	int nr_ptts = 0;
 	int i = 0;
 
 	if (!evlist)
@@ -66,13 +122,14 @@ struct auxtrace_record
 
 	cs_etm_pmu = perf_pmu__find(CORESIGHT_ETM_PMU_NAME);
 	arm_spe_pmus = find_all_arm_spe_pmus(&nr_spes, err);
+	hisi_ptt_pmus = find_all_hisi_ptt_pmus(&nr_ptts, err);
 
 	evlist__for_each_entry(evlist, evsel) {
 		if (cs_etm_pmu &&
 		    evsel->core.attr.type == cs_etm_pmu->type)
 			found_etm = true;
 
-		if (!nr_spes || found_spe)
+		if ((!nr_spes || found_spe) && (!nr_ptts || found_ptt))
 			continue;
 
 		for (i = 0; i < nr_spes; i++) {
@@ -81,11 +138,18 @@ struct auxtrace_record
 				break;
 			}
 		}
+
+		for (i = 0; i < nr_ptts; i++) {
+			if (evsel->core.attr.type == hisi_ptt_pmus[i]->type) {
+				found_ptt = hisi_ptt_pmus[i];
+				break;
+			}
+		}
 	}
 	free(arm_spe_pmus);
 
-	if (found_etm && found_spe) {
-		pr_err("Concurrent ARM Coresight ETM and SPE operation not currently supported\n");
+	if (found_etm && found_spe && found_ptt) {
+		pr_err("Concurrent ARM Coresight ETM ,SPE and HiSilicon PCIe Trace operation not currently supported\n");
 		*err = -EOPNOTSUPP;
 		return NULL;
 	}
@@ -96,6 +160,9 @@ struct auxtrace_record
 #if defined(__aarch64__)
 	if (found_spe)
 		return arm_spe_recording_init(err, found_spe);
+
+	if (found_ptt)
+		return hisi_ptt_recording_init(err, found_ptt);
 #endif
 
 	/*
