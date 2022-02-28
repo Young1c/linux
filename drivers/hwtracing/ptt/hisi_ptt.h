@@ -13,6 +13,7 @@
 #include <linux/list.h>
 #include <linux/mutex.h>
 #include <linux/pci.h>
+#include <linux/perf_event.h>
 #include <linux/types.h>
 
 #define DRV_NAME "hisi_ptt"
@@ -84,6 +85,7 @@ struct hisi_ptt_dma_buffer {
  * @trace_buf:   array of the trace buffers for holding the trace data.
  *               the length will be HISI_PTT_TRACE_BUF_CNT.
  * @status:      current trace status
+ * @handle:      perf output handle of current trace session
  * @default_cpu: default cpu to start the trace session
  * @buf_index:   the index of current using trace buffer
  * @is_port:     whether we're tracing root port or not
@@ -95,6 +97,7 @@ struct hisi_ptt_dma_buffer {
 struct hisi_ptt_trace_ctrl {
 	struct hisi_ptt_dma_buffer *trace_buf;
 	enum hisi_ptt_trace_status status;
+	struct perf_output_handle handle;
 	int default_cpu;
 	u32 buf_index;
 	bool is_port;
@@ -114,9 +117,25 @@ struct hisi_ptt_filter_desc {
 	struct pci_dev *pdev;
 };
 
+
+/**
+ * struct hisi_ptt_pmu_buf - descriptor of the AUX buffer of PTT trace
+ * @length:   size of the AUX buffer
+ * @nr_pages: number of pages of the AUX buffer
+ * @base:     start address of AUX buffer
+ * @pos:      position in the AUX buffer to commit traced data
+ */
+struct hisi_ptt_pmu_buf {
+	size_t length;
+	int nr_pages;
+	void *base;
+	long pos;
+};
+
 /**
  * struct hisi_ptt - per PTT device data
  * @trace_ctrl:   the control information of PTT trace
+ * @hisi_ptt_pmu: the pum device of trace
  * @iobase:       base IO address of the device
  * @pdev:         pci_dev of this PTT device
  * @mutex:        mutex to protect the filter list and serialize the perf process.
@@ -128,6 +147,7 @@ struct hisi_ptt_filter_desc {
  */
 struct hisi_ptt {
 	struct hisi_ptt_trace_ctrl trace_ctrl;
+	struct pmu hisi_ptt_pmu;
 	void __iomem *iobase;
 	struct pci_dev *pdev;
 	struct mutex mutex;
@@ -145,5 +165,7 @@ struct hisi_ptt {
 	struct list_head req_filters;
 	u16 port_mask;
 };
+
+#define to_hisi_ptt(pmu) container_of(pmu, struct hisi_ptt, hisi_ptt_pmu)
 
 #endif /* _HISI_PTT_H */

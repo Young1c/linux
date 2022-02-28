@@ -17,6 +17,7 @@
 #include <linux/iopoll.h>
 #include <linux/module.h>
 #include <linux/sysfs.h>
+#include <linux/vmalloc.h>
 
 #include "hisi_ptt.h"
 
@@ -161,6 +162,114 @@ static int hisi_ptt_trace_start(struct hisi_ptt *hisi_ptt)
 	return 0;
 }
 
+static int hisi_ptt_update_aux(struct hisi_ptt *hisi_ptt, int index, bool stop)
+{
+	struct hisi_ptt_trace_ctrl *ctrl = &hisi_ptt->trace_ctrl;
+	struct perf_output_handle *handle = &ctrl->handle;
+	struct perf_event *event = handle->event;
+	struct hisi_ptt_pmu_buf *buf;
+	void *addr;
+
+	buf = perf_get_aux(handle);
+	if (!buf || !handle->size)
+		return -EINVAL;
+
+	addr = ctrl->trace_buf[ctrl->buf_index].addr;
+
+	memcpy(buf->base + buf->pos, addr, HISI_PTT_TRACE_BUF_SIZE);
+	memset(addr, 0, HISI_PTT_TRACE_BUF_SIZE);
+	buf->pos += HISI_PTT_TRACE_BUF_SIZE;
+
+	if (stop) {
+		perf_aux_output_end(handle, buf->pos);
+	} else if (buf->length - buf->pos < HISI_PTT_TRACE_BUF_SIZE) {
+		perf_aux_output_skip(handle, buf->length - buf->pos);
+		perf_aux_output_end(handle, buf->pos);
+
+		buf = perf_aux_output_begin(handle, event);
+		if (!buf)
+			return -EINVAL;
+
+		buf->pos = handle->head % buf->length;
+		if (buf->length - buf->pos < HISI_PTT_TRACE_BUF_SIZE) {
+			perf_aux_output_end(handle, 0);
+			return -EINVAL;
+		}
+	}
+
+	return 0;
+}
+
+static irqreturn_t hisi_ptt_isr(int irq, void *context)
+{
+	struct hisi_ptt *hisi_ptt = context;
+	u32 status, buf_idx;
+
+	status = readl(hisi_ptt->iobase + HISI_PTT_TRACE_INT_STAT);
+	buf_idx = ffs(status) - 1;
+
+	/* Clear the interrupt status of buffer @buf_idx */
+	writel(status, hisi_ptt->iobase + HISI_PTT_TRACE_INT_STAT);
+
+	/*
+	 * Update the AUX buffer and cache the current buffer index,
+	 * as we need to know this and save the data when the trace
+	 * is ended out of the interrupt handler. End the trace
+	 * if the updating fails.
+	 */
+	if (hisi_ptt_update_aux(hisi_ptt, buf_idx, false))
+		hisi_ptt_trace_end(hisi_ptt);
+	else
+		hisi_ptt->trace_ctrl.buf_index = (buf_idx + 1) % HISI_PTT_TRACE_BUF_CNT;
+
+	return IRQ_HANDLED;
+}
+
+static irqreturn_t hisi_ptt_irq(int irq, void *context)
+{
+	struct hisi_ptt *hisi_ptt = context;
+	u32 status;
+
+	status = readl(hisi_ptt->iobase + HISI_PTT_TRACE_INT_STAT);
+	if (!(status & HISI_PTT_TRACE_INT_STAT_MASK))
+		return IRQ_NONE;
+
+	return IRQ_WAKE_THREAD;
+}
+
+static void hisi_ptt_irq_free_vectors(void *pdev)
+{
+	pci_free_irq_vectors(pdev);
+}
+
+static int hisi_ptt_register_irq(struct hisi_ptt *hisi_ptt)
+{
+	struct pci_dev *pdev = hisi_ptt->pdev;
+	int ret;
+
+	ret = pci_alloc_irq_vectors(pdev, 1, 1, PCI_IRQ_MSI);
+	if (ret < 0) {
+		pci_err(pdev, "failed to allocate irq vector, ret = %d.\n", ret);
+		return ret;
+	}
+
+	ret = devm_add_action_or_reset(&pdev->dev, hisi_ptt_irq_free_vectors, pdev);
+	if (ret < 0)
+		return ret;
+
+	ret = devm_request_threaded_irq(&pdev->dev,
+					pci_irq_vector(pdev, HISI_PTT_TRACE_DMA_IRQ),
+					hisi_ptt_irq, hisi_ptt_isr, 0,
+					DRV_NAME, hisi_ptt);
+	if (ret) {
+		pci_err(pdev, "failed to request irq %d, ret = %d.\n",
+			pci_irq_vector(pdev, HISI_PTT_TRACE_DMA_IRQ), ret);
+		return ret;
+	}
+
+	return 0;
+}
+
 static int hisi_ptt_init_filters(struct pci_dev *pdev, void *data)
 {
 	struct hisi_ptt_filter_desc *filter;
@@ -228,6 +337,419 @@ static void hisi_ptt_init_ctrls(struct hisi_ptt *hisi_ptt)
 	hisi_ptt->trace_ctrl.default_cpu = cpumask_first(cpumask_of_node(dev_to_node(&pdev->dev)));
 }
 
+#define HISI_PTT_PMU_FILTER_IS_PORT	BIT(19)
+#define HISI_PTT_PMU_FILTER_VAL_MASK	GENMASK(15, 0)
+#define HISI_PTT_PMU_DIRECTION_MASK	GENMASK(23, 20)
+#define HISI_PTT_PMU_TYPE_MASK		GENMASK(31, 24)
+#define HISI_PTT_PMU_FORMAT_MASK	GENMASK(35, 32)
+
+static ssize_t available_root_port_filters_show(struct device *dev,
+						struct device_attribute *attr,
+						char *buf)
+{
+	struct hisi_ptt *hisi_ptt = to_hisi_ptt(dev_get_drvdata(dev));
+	struct hisi_ptt_filter_desc *filter;
+	int pos = 0;
+
+	mutex_lock(&hisi_ptt->mutex);
+	if (list_empty(&hisi_ptt->port_filters)) {
+		pos = sysfs_emit(buf, "\n");
+		goto out;
+	}
+
+	list_for_each_entry(filter, &hisi_ptt->port_filters, list)
+		pos += sysfs_emit_at(buf, pos, "%s	0x%05lx\n",
+				     pci_name(filter->pdev),
+				     hisi_ptt_get_filter_val(filter->pdev) |
+				     HISI_PTT_PMU_FILTER_IS_PORT);
+
+out:
+	mutex_unlock(&hisi_ptt->mutex);
+	return pos;
+}
+static DEVICE_ATTR_ADMIN_RO(available_root_port_filters);
+
+static ssize_t available_requester_filters_show(struct device *dev,
+						struct device_attribute *attr,
+						char *buf)
+{
+	struct hisi_ptt *hisi_ptt = to_hisi_ptt(dev_get_drvdata(dev));
+	struct hisi_ptt_filter_desc *filter;
+	int pos = 0;
+
+	mutex_lock(&hisi_ptt->mutex);
+	if (list_empty(&hisi_ptt->req_filters)) {
+		pos = sysfs_emit(buf, "\n");
+		goto out;
+	}
+
+	list_for_each_entry(filter, &hisi_ptt->req_filters, list)
+		pos += sysfs_emit_at(buf, pos, "%s	0x%05x\n",
+				     pci_name(filter->pdev),
+				     hisi_ptt_get_filter_val(filter->pdev));
+
+out:
+	mutex_unlock(&hisi_ptt->mutex);
+	return pos;
+}
+static DEVICE_ATTR_ADMIN_RO(available_requester_filters);
+
+PMU_FORMAT_ATTR(filter,		"config:0-19");
+PMU_FORMAT_ATTR(direction,	"config:20-23");
+PMU_FORMAT_ATTR(type,		"config:24-31");
+PMU_FORMAT_ATTR(format,		"config:32-35");
+
+static struct attribute *hisi_ptt_pmu_format_attrs[] = {
+	&format_attr_filter.attr,
+	&format_attr_direction.attr,
+	&format_attr_type.attr,
+	&format_attr_format.attr,
+	NULL
+};
+
+static struct attribute_group hisi_ptt_pmu_format_group = {
+	.name = "format",
+	.attrs = hisi_ptt_pmu_format_attrs,
+};
+
+static struct attribute *hisi_ptt_pmu_filter_attrs[] = {
+	&dev_attr_available_root_port_filters.attr,
+	&dev_attr_available_requester_filters.attr,
+	NULL
+};
+
+static struct attribute_group hisi_ptt_pmu_filter_group = {
+	.attrs = hisi_ptt_pmu_filter_attrs,
+};
+
+static const struct attribute_group *hisi_ptt_pmu_groups[] = {
+	&hisi_ptt_pmu_format_group,
+	&hisi_ptt_pmu_filter_group,
+	NULL
+};
+
+/*
+ * Check whether the config is valid or not. Some configs are multi-selectable
+ * and can be set simultaneously, while some are single selectable (onehot).
+ * Use this function to check the non-onehot configs while
+ * hisi_ptt_trace_valid_config_onehot() for the onehot ones.
+ */
+static int hisi_ptt_trace_valid_config(u32 val, const u32 *available_list, u32 list_size)
+{
+	int i;
+
+	/* The non-onehot configs cannot be 0. */
+	if (!val)
+		return -EINVAL;
+
+	/*
+	 * Walk the available list and clear the valid bits of
+	 * the config. If there is any resident bit after the
+	 * walk then the config is invalid.
+	 */
+	for (i = 0; i < list_size; i++)
+		val &= ~available_list[i];
+
+	return val ? -EINVAL : 0;
+}
+
+static int hisi_ptt_trace_valid_config_onehot(u32 val, const u32 *available_list, u32 list_size)
+{
+	int i;
+
+	for (i = 0; i < list_size; i++)
+		if (val == available_list[i])
+			return 0;
+
+	return -EINVAL;
+}
+
+static int hisi_ptt_trace_init_filter(struct hisi_ptt *hisi_ptt, u64 config)
+{
+	unsigned long val, port_mask = hisi_ptt->port_mask;
+	struct hisi_ptt_filter_desc *filter;
+	int ret = -EINVAL;
+
+	hisi_ptt->trace_ctrl.is_port = FIELD_GET(HISI_PTT_PMU_FILTER_IS_PORT, config);
+	val = FIELD_GET(HISI_PTT_PMU_FILTER_VAL_MASK, config);
+
+	/*
+	 * Port filters are defined as bit mask. For port filters, check
+	 * the bits in the @val are within the range of hisi_ptt->port_mask
+	 * and whether it's empty or not, otherwise user has specified
+	 * some unsupported root ports.
+	 *
+	 * For Requester ID filters, walk the available filter list to see
+	 * whether we have one matched.
+	 */
+	if (!hisi_ptt->trace_ctrl.is_port) {
+		list_for_each_entry(filter, &hisi_ptt->req_filters, list)
+			if (val == hisi_ptt_get_filter_val(filter->pdev)) {
+				ret = 0;
+				break;
+			}
+	} else if (bitmap_subset(&val, &port_mask, BITS_PER_LONG)) {
+		ret = 0;
+	}
+
+	if (ret)
+		return ret;
+
+	hisi_ptt->trace_ctrl.filter = val;
+	return 0;
+}
+
+static int hisi_ptt_pmu_event_init(struct perf_event *event)
+{
+	/*
+	 * The supported value of the direction parameter. See hisi_ptt.rst
+	 * documentation for more details.
+	 */
+	static const u32 hisi_ptt_trace_available_direction[] = {
+		0,
+		1,
+		2,
+		3,
+	};
+	/* Different types can be set simultaneously */
+	static const u32 hisi_ptt_trace_available_type[] = {
+		1,	/* posted_request */
+		2,	/* non-posted_request */
+		4,	/* completion */
+	};
+	static const u32 hisi_ptt_trace_availble_format[] = {
+		0,	/* 4DW */
+		1,	/* 8DW */
+	};
+	struct hisi_ptt *hisi_ptt = to_hisi_ptt(event->pmu);
+	struct hisi_ptt_trace_ctrl *ctrl = &hisi_ptt->trace_ctrl;
+	int ret;
+	u32 val;
+
+	if (event->attr.type != hisi_ptt->hisi_ptt_pmu.type)
+		return -ENOENT;
+
+	mutex_lock(&hisi_ptt->mutex);
+
+	ret = hisi_ptt_trace_init_filter(hisi_ptt, event->attr.config);
+	if (ret < 0)
+		goto out;
+
+	val = FIELD_GET(HISI_PTT_PMU_DIRECTION_MASK, event->attr.config);
+	ret = hisi_ptt_trace_valid_config_onehot(val, hisi_ptt_trace_available_direction,
+						 ARRAY_SIZE(hisi_ptt_trace_available_direction));
+	if (ret < 0)
+		goto out;
+	ctrl->direction = val;
+
+	val = FIELD_GET(HISI_PTT_PMU_TYPE_MASK, event->attr.config);
+	ret = hisi_ptt_trace_valid_config(val, hisi_ptt_trace_available_type,
+					  ARRAY_SIZE(hisi_ptt_trace_available_type));
+	if (ret < 0)
+		goto out;
+	ctrl->type = val;
+
+	val = FIELD_GET(HISI_PTT_PMU_FORMAT_MASK, event->attr.config);
+	ret = hisi_ptt_trace_valid_config_onehot(val, hisi_ptt_trace_availble_format,
+						 ARRAY_SIZE(hisi_ptt_trace_availble_format));
+	if (ret < 0)
+		goto out;
+	ctrl->format = val;
+
+out:
+	mutex_unlock(&hisi_ptt->mutex);
+	return ret;
+}
+
+static void *hisi_ptt_pmu_setup_aux(struct perf_event *event, void **pages,
+				    int nr_pages, bool overwrite)
+{
+	struct hisi_ptt_pmu_buf *buf;
+	struct page **pagelist;
+	int i;
+
+	if (overwrite) {
+		dev_warn(event->pmu->dev, "Overwrite mode is not supported\n");
+		return NULL;
+	}
+
+	/* If the pages size less than buffers, we cannot start trace */
+	if (nr_pages < HISI_PTT_TRACE_TOTAL_BUF_SIZE / PAGE_SIZE)
+		return NULL;
+
+	buf = kzalloc(sizeof(*buf), GFP_KERNEL);
+	if (!buf)
+		return NULL;
+
+	pagelist = kcalloc(nr_pages, sizeof(*pagelist), GFP_KERNEL);
+	if (!pagelist) {
+		kfree(buf);
+		return NULL;
+	}
+
+	for (i = 0; i < nr_pages; i++)
+		pagelist[i] = virt_to_page(pages[i]);
+
+	buf->base = vmap(pagelist, nr_pages, VM_MAP, PAGE_KERNEL);
+	if (!buf->base) {
+		kfree(pagelist);
+		kfree(buf);
+		return NULL;
+	}
+
+	buf->nr_pages = nr_pages;
+	buf->length = nr_pages * PAGE_SIZE;
+	buf->pos = 0;
+
+	kfree(pagelist);
+	return buf;
+}
+
+static void hisi_ptt_pmu_free_aux(void *aux)
+{
+	struct hisi_ptt_pmu_buf *buf = aux;
+
+	vunmap(buf->base);
+	kfree(buf);
+}
+
+static void hisi_ptt_pmu_start(struct perf_event *event, int flags)
+{
+	struct hisi_ptt *hisi_ptt = to_hisi_ptt(event->pmu);
+	struct perf_output_handle *handle = &hisi_ptt->trace_ctrl.handle;
+	struct hw_perf_event *hwc = &event->hw;
+	struct hisi_ptt_pmu_buf *buf;
+	int cpu = event->cpu;
+	int ret;
+
+	hwc->state = 0;
+	mutex_lock(&hisi_ptt->mutex);
+	if (hisi_ptt->trace_ctrl.status == HISI_PTT_TRACE_STATUS_ON) {
+		pci_dbg(hisi_ptt->pdev, "trace has already started\n");
+		goto stop;
+	}
+
+	if (cpu == -1)
+		cpu = hisi_ptt->trace_ctrl.default_cpu;
+
+	/*
+	 * Handle the interrupt on the same cpu which starts the trace to avoid
+	 * context mismatch. Otherwise we'll trigger the WARN from the perf
+	 * core in event_function_local().
+	 */
+	WARN_ON(irq_set_affinity(pci_irq_vector(hisi_ptt->pdev, HISI_PTT_TRACE_DMA_IRQ),
+				 cpumask_of(cpu)));
+
+	ret = hisi_ptt_alloc_trace_buf(hisi_ptt);
+	if (ret) {
+		pci_dbg(hisi_ptt->pdev, "alloc trace buf failed, ret = %d\n", ret);
+		goto stop;
+	}
+
+	buf = perf_aux_output_begin(handle, event);
+	if (!buf) {
+		pci_dbg(hisi_ptt->pdev, "aux output begin failed\n");
+		goto stop;
+	}
+
+	buf->pos = handle->head % buf->length;
+
+	ret = hisi_ptt_trace_start(hisi_ptt);
+	if (ret) {
+		pci_dbg(hisi_ptt->pdev, "trace start failed, ret = %d\n", ret);
+		perf_aux_output_end(handle, 0);
+		goto stop;
+	}
+
+	mutex_unlock(&hisi_ptt->mutex);
+	return;
+stop:
+	event->hw.state |= PERF_HES_STOPPED;
+	mutex_unlock(&hisi_ptt->mutex);
+}
+
+static void hisi_ptt_pmu_stop(struct perf_event *event, int flags)
+{
+	struct hisi_ptt *hisi_ptt = to_hisi_ptt(event->pmu);
+	struct hw_perf_event *hwc = &event->hw;
+
+	if (hwc->state & PERF_HES_STOPPED)
+		return;
+
+	mutex_lock(&hisi_ptt->mutex);
+	if (hisi_ptt->trace_ctrl.status == HISI_PTT_TRACE_STATUS_ON) {
+		hisi_ptt_trace_end(hisi_ptt);
+		WARN(!hisi_ptt_wait_trace_hw_idle(hisi_ptt), "Device is still busy");
+		hisi_ptt_update_aux(hisi_ptt, hisi_ptt->trace_ctrl.buf_index, true);
+	}
+	mutex_unlock(&hisi_ptt->mutex);
+
+	hwc->state |= PERF_HES_STOPPED;
+	perf_event_update_userpage(event);
+	hwc->state |= PERF_HES_UPTODATE;
+}
+
+static int hisi_ptt_pmu_add(struct perf_event *event, int flags)
+{
+	struct hisi_ptt *hisi_ptt = to_hisi_ptt(event->pmu);
+	struct hw_perf_event *hwc = &event->hw;
+	int cpu = event->cpu;
+
+	/*
+	 * Only allow the default cpu to add the event if user doesn't specify
+	 * the cpus.
+	 */
+	if (cpu == -1 && smp_processor_id() != hisi_ptt->trace_ctrl.default_cpu)
+		return 0;
+
+	hwc->state = PERF_HES_STOPPED | PERF_HES_UPTODATE;
+
+	if (flags & PERF_EF_START) {
+		hisi_ptt_pmu_start(event, PERF_EF_RELOAD);
+		if (hwc->state & PERF_HES_STOPPED)
+			return -EINVAL;
+	}
+
+	return 0;
+}
+
+static void hisi_ptt_pmu_del(struct perf_event *event, int flags)
+{
+	hisi_ptt_pmu_stop(event, PERF_EF_UPDATE);
+}
+
+static int hisi_ptt_register_pmu(struct hisi_ptt *hisi_ptt)
+{
+	u16 core_id, sicl_id;
+	char *pmu_name;
+	u32 reg;
+
+	hisi_ptt->hisi_ptt_pmu = (struct pmu) {
+		.module		= THIS_MODULE,
+		.capabilities	= PERF_PMU_CAP_EXCLUSIVE | PERF_PMU_CAP_ITRACE,
+		.task_ctx_nr	= perf_sw_context,
+		.attr_groups	= hisi_ptt_pmu_groups,
+		.event_init	= hisi_ptt_pmu_event_init,
+		.setup_aux	= hisi_ptt_pmu_setup_aux,
+		.free_aux	= hisi_ptt_pmu_free_aux,
+		.start		= hisi_ptt_pmu_start,
+		.stop		= hisi_ptt_pmu_stop,
+		.add		= hisi_ptt_pmu_add,
+		.del		= hisi_ptt_pmu_del,
+	};
+
+	reg = readl(hisi_ptt->iobase + HISI_PTT_LOCATION);
+	core_id = FIELD_GET(HISI_PTT_CORE_ID, reg);
+	sicl_id = FIELD_GET(HISI_PTT_SICL_ID, reg);
+
+	pmu_name = devm_kasprintf(&hisi_ptt->pdev->dev, GFP_KERNEL, "hisi_ptt%u_%u",
+				  sicl_id, core_id);
+	if (!pmu_name)
+		return -ENOMEM;
+
+	return perf_pmu_register(&hisi_ptt->hisi_ptt_pmu, pmu_name, -1);
+}
+
 /*
  * The DMA of PTT trace can only use direct mapping, due to some
  * hardware restriction. Check whether there is an IOMMU or the
@@ -289,7 +811,17 @@ static int hisi_ptt_probe(struct pci_dev *pdev,
 	}
 	pci_set_master(pdev);
 
+	ret = hisi_ptt_register_irq(hisi_ptt);
+	if (ret)
+		return ret;
+
 	hisi_ptt_init_ctrls(hisi_ptt);
+
+	ret = hisi_ptt_register_pmu(hisi_ptt);
+	if (ret) {
+		pci_err(pdev, "failed to register pmu device, ret = %d", ret);
+		return ret;
+	}
 
 	return 0;
 }
@@ -298,9 +830,7 @@ void hisi_ptt_remove(struct pci_dev *pdev)
 {
 	struct hisi_ptt *hisi_ptt = pci_get_drvdata(pdev);
 
-	if (hisi_ptt->trace_ctrl.status == HISI_PTT_TRACE_STATUS_ON)
-		hisi_ptt_trace_end(hisi_ptt);
-
+	perf_pmu_unregister(&hisi_ptt->hisi_ptt_pmu);
 	hisi_ptt_release_filters(hisi_ptt);
 }
 
